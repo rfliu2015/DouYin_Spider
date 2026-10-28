@@ -4,6 +4,25 @@ from dotenv import load_dotenv
 
 dy_auth = None
 dy_live_auth = None
+
+
+def _env_multiline(name):
+    """读取可能含换行的 .env 值。
+
+    .env 是按行解析的，PEM 这类多行内容不能直接写进去。约定：
+    以 b64: 开头的值表示 base64 编码的单行内容，读回时还原成原文。
+    browser_credential.py 就按这个约定写入 DY_PRIVATE_KEY。
+    """
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    if raw.startswith("b64:"):
+        import base64
+        try:
+            return base64.b64decode(raw[4:]).decode("utf-8")
+        except Exception:
+            return None
+    return raw
 def load_env(env_path=None, *, bootstrap_creator=False, proxies=None):
     global dy_auth, dy_live_auth
     load_dotenv(dotenv_path=env_path, override=bool(env_path))
@@ -14,7 +33,7 @@ def load_env(env_path=None, *, bootstrap_creator=False, proxies=None):
         ticket=os.getenv('DY_TICKET') or None,
         ts_sign=os.getenv('DY_TS_SIGN') or None,
         client_cert=os.getenv('DY_CLIENT_CERT') or None,
-        private_key=os.getenv('DY_PRIVATE_KEY') or None,
+        private_key=_env_multiline('DY_PRIVATE_KEY'),
         dtrait_blob=os.getenv('DY_DTRAIT_BLOB') or None,
         session_dtrait=os.getenv('DY_SESSION_DTRAIT') or None,
         bootstrap_creator=bootstrap_creator,
