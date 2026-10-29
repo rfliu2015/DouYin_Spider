@@ -1,91 +1,163 @@
-# Douyin_Spider 逆向研究笔记
+# DouYin_Spider 逆向研究笔记
 
-> 项目：[`cv-cat/Douyin_Spider`](https://github.com/cv-cat/Douyin_Spider)
-> 本地路径：`E:\Code\Projects\DouYin_Spider`（旧：`ReverseProjects\Douyin_Spider`）
-> 记录时间：2026-10-28（10 号文档更新于 2026-10-29）
-> 目的：跑通项目、评估能力边界、记录踩坑与结论
-
----
-
-## 文档索引
-
-| 文档 | 内容 |
-|---|---|
-| [01-环境搭建.md](01-环境搭建.md) | 依赖安装、protobuf 冲突解决、环境验证 |
-| [02-运行实测.md](02-运行实测.md) | 各功能实测结果与成功率数据 |
-| [03-扫码登录攻坚.md](03-扫码登录攻坚.md) | 纯 HTTP 扫码登录的完整尝试过程与失败根因 |
-| [04-get_user_info诊断.md](04-get_user_info诊断.md) | 唯一失败读接口的完整排查实验 |
-| [05-能力边界与结论.md](05-能力边界与结论.md) | 最终能力矩阵、与自研 dyclaw 的对比、后续建议 |
-| [06-文章核对-发文风控参数.md](06-文章核对-发文风控参数.md) | 外部文章与项目源码逐条核对，含 fpk1 突破思路 |
-| [07-浏览器登录提取方案.md](07-浏览器登录提取方案.md) | **⭐ 突破方案**：从浏览器提取私钥与凭证，绕过 fpk1 |
-| [08-写接口测试与blocked分析.md](08-写接口测试与blocked分析.md) | 写接口实测、换账号验证、blocked 环境级限制分析 |
-| [09-迁移到新机器指南.md](09-迁移到新机器指南.md) | **⭐ 换机器/换网络验证的完整步骤** |
-| [10-新机器迁移实测.md](10-新机器迁移实测.md) | **⭐ P0–P3 实测结论：blocked 被证伪，卡点变为 key-sign-result=2** |
+> 项目：[cv-cat/DouYin_Spider](https://github.com/cv-cat/DouYin_Spider)
+> 本地路径：`E:\Code\Projects\DouYin_Spider`
+> fork HEAD：`7f721cf`
+> 最后更新：2026-10-29
 
 ---
 
 ## 一句话结论
 
-**读能力完整可用；写接口受阻于环境级 blocked，与代码无关。**
+**读能力完整可用，写能力全部不可用。**
 
-- 扫码登录被 fpk1 拦截 → **已绕过**：从浏览器 localStorage 提取私钥与 ticket 素材注入 auth（见 [07](07-浏览器登录提取方案.md)）
-- 用户主页从 **0/8 → 7/8**
-- 写接口技术前提全部就绪（ticket/私钥/dtrait/csrf 齐全），但 `profile/self` 返回 `blocked`，**换账号后仍然 blocked** → 判定为 IP/设备级限制（见 [08](08-写接口测试与blocked分析.md)）
-- **已换机器验证**：新机器上 `profile/self` 返回正常用户数据（`status_code:0`，**非 blocked**）→ blocked 确认为原机器 IP/设备级限制（见 [10](10-新机器迁移实测.md)）
-- 写接口卡点已从 `blocked` 变为 `bd-ticket-guard-key-sign-result: 2`（ticket 签名校验失败），待深挖（见 [10](10-新机器迁移实测.md)）
-- **已定位**：凭证本身无时效问题（连测 3 次 + 20s 后均正常），是**写请求作废了会话 ticket**——作废是后果，签名算法不匹配才是根因（见 [10](10-新机器迁移实测.md) §3.3）
+- ✅ 作品 / 评论 / 搜索 / 用户主页 / 直播 —— 全部跑通
+- ❌ 点赞 / 收藏 / 评论 / 发布 / 私信 —— 卡在 `bd-ticket-guard-key-sign-result: 2`
 
 ---
 
-## 快速状态
+## 能力矩阵
 
-```
-项目版本   7f721cf（fork HEAD，含 browser_credential.py 与 docs/）
-Python     3.12.4
-依赖       22/22 全部安装并可导入
-测试       13 passed / 8 failed（均为上游既有问题，与本次操作无关）
-代码规模   65 个 py 文件 / 27213 行
-当前状态   cookie 已配置，读链路可用
-```
-
-## 已验证可用的能力
-
-| 能力 | 状态 | 证据 |
+| 能力 | 状态 | 备注 |
 |---|---|---|
-| 依赖安装 / 模块导入 | ✅ | 22 个依赖全部 import 成功 |
-| 签名栈（a_bogus / msToken / secsdk） | ✅ | 纯 Python 本地计算，无需浏览器 |
-| 作品详情 | ✅ 8/8 | 抓到真实数据 |
-| 一级评论 | ✅ 8/8 | 43 条评论 |
-| 内层回复 | ✅ | 展开 11 条回复 |
-| 作品列表 | ✅ 8/8 | — |
-| Excel 导出 | ✅ | 生成 6456 B 文件 |
-| 直播信息（匿名） | ✅ | 真实返回房间数据 |
-| 直播 WebSocket（匿名） | ⚠️ | 握手成功，房间未开播 |
+| 作品详情 | ✅ | 稳定 |
+| 作品列表 | ✅ | — |
+| 评论 / 回复 | ✅ | — |
+| 搜索 | ✅ | — |
+| 用户主页 | ✅ | 需 ticket 注入 |
+| Excel 导出 | ✅ | — |
+| 直播信息 / WebSocket | ✅ | 免登录 |
+| 点赞 / 收藏 | ❌ | `key-sign-result: 2` |
+| 发评论 / 发布 / 私信 | ❌ | 同上 |
 
-## 已知阻塞（已解决 / 仍存在）
+---
 
-| 问题 | 状态 | 说明 |
-|---|---|---|
-| 扫码登录失败 | ⚠️ 未解决，但已绕过 | fpk1 用内置 fixture → 服务端限频。改用浏览器提取方案 |
-| `get_user_info` 0/8 | ✅ 已解决 | 提取 ticket + 私钥注入后 → 7/8 |
-| 8 个测试失败 | ⚠️ 仍存在 | 上游 HEAD 既有问题，不影响主流程 |
+## 文档结构
 
-## 新增工具
+本文档按**信息半衰期**分三层：
 
-```bash
-# 从浏览器 profile 提取 ticket-guard 素材并写入 .env
-python browser_credential.py
-python browser_credential.py --list      # 列出可用 profile
-python browser_credential.py --dry-run   # 只提取不写入
+```
+docs/
+├── README.md          ← 你在这里
+│
+├── 状态/              【可变项】反映"现在"，每次实验后更新
+│   ├── 当前状态.md     一页纸：能力 / 凭证 / 风险 / 下一步
+│   ├── 进度日志.md     倒序追加，只记事实
+│   └── 未解问题.md     悬案 + 实验队列
+│
+├── 主题/              【不变项】有定论，只写结论与必要步骤
+│   ├── 环境搭建.md     依赖 / protobuf 冲突 / 循环导入
+│   ├── 签名栈.md       a_bogus / secsdk / msToken / dtrait / bd-ticket
+│   ├── 凭证提取.md     leveldb 原理 + 浏览器加密对照
+│   ├── 读能力.md       作品 / 评论 / 直播 / 用户主页
+│   ├── 写能力.md       为什么不通
+│   ├── 扫码登录.md     fpk1 根因（已判死刑）
+│   └── 工具手册.md     browser_credential.py / main.py
+│
+└── archive/           历史原文，不再维护
+    └── 01 ~ 10
 ```
 
-写入 `DY_TICKET` / `DY_TS_SIGN` / `DY_CLIENT_CERT` / `DY_PRIVATE_KEY`。
-详见 [07-浏览器登录提取方案.md](07-浏览器登录提取方案.md)。
+**阅读建议**：
+
+| 你想知道 | 去哪看 |
+|---|---|
+| 现在能做什么 | [状态/当前状态](状态/当前状态.md) |
+| 怎么装环境 | [主题/环境搭建](主题/环境搭建.md) |
+| 怎么拿凭证 | [主题/凭证提取](主题/凭证提取.md) + [工具手册](主题/工具手册.md) |
+| 签名怎么算 | [主题/签名栈](主题/签名栈.md) |
+| 写接口为什么不通 | [主题/写能力](主题/写能力.md) |
+| 当初踩了哪些坑 | `archive/` |
+
+---
+
+## 快速开始
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+
+# 1. 装依赖（protobuf 有硬冲突，不能用 -r requirements.txt）
+Get-Content requirements.txt |
+  Where-Object { $_ -notmatch '^(protobuf|blackboxprotobuf)' -and $_ -notmatch '^#' -and $_.Trim() } |
+  Set-Content req_rest.txt
+pip install -r req_rest.txt
+pip install 'protobuf>=5.27,<6'
+pip install --no-deps blackboxprotobuf
+
+# 2. 验证
+python -c "import main; print('OK')"      # → OK
+python -m pytest tests -q                  # → 13 passed, 8 failed
+
+# 3. 提取凭证（必须先完全退出浏览器）
+python browser_credential.py --list
+python browser_credential.py --profile "<profile 目录>" --dry-run
+python browser_credential.py --profile "<profile 目录>"
+```
+
+详见 [环境搭建](主题/环境搭建.md) / [工具手册](主题/工具手册.md)。
+
+---
+
+## 项目规模
+
+| 项 | 数据 |
+|---|---|
+| 上游 | `cv-cat/DouYin_Spider`（最后提交 2026-10-23） |
+| 代码 | **59 个 py 文件 / 27377 行** |
+| 模块 | `dy_live` 11304 · `dy_apis` 9421 · `utils` 3324 · `builder` 1873 · `tests` 378 |
+| 依赖 | 22 个，纯 Python，无浏览器依赖 |
+
+---
+
+## 这个项目最强的地方
+
+**纯 Python 重写了 5 类反爬签名**，不需要浏览器跑 JS：
+
+| 模块 | 行数 | 亮点 |
+|---|---|---|
+| `utils/secsdk_web_sign.py` | 187 | webSign 纯算（同类项目都要开 headless） |
+| `utils/ab_pure.py` | ~400 | a_bogus 按 host 分 **4 套** `(aid, page_id)` |
+| `utils/dtrait_features.py` | 225 | dtrait 内层 VM，解出头字节位域 |
+| `utils/bd_ticket.py` | ~300 | ECDH + HKDF + HMAC/ECDSA 双模式 |
+| `dy_live` | 11304 | 直播 WebSocket / PK / 礼物 / 9 个 proto |
+
+详见 [签名栈](主题/签名栈.md)。
+
+---
+
+## fork 加了什么
+
+`7f721cf` 相对上游 `d151f9c`（+2961 / −1）：
+
+| 文件 | 变化 | 性质 |
+|---|---|---|
+| `browser_credential.py` | +592 行 | **全新**，凭证提取工具 |
+| `utils/common_util.py` | +21/−1 | `DY_PRIVATE_KEY` 支持 b64 单行 |
+| `docs/` | — | 研究笔记 |
+
+> ⚠️ **写接口路线是 fork 加的旁路，不是原项目的主路径。**
+> 原项目写接口走扫码登录，被 fpk1 拦死（见 [扫码登录](主题/扫码登录.md)）。
 
 ---
 
 ## 重要提醒
 
-- `.env` 含真实登录 cookie，已在 `.gitignore` 中，**切勿提交**
-- 限频（`error_code=7`）是服务端冷却，**反复重试会加重**，实测间隔 3 天仍会触发
-- 项目根目录的 `_*.py` 与 `_*.txt` 是本次调试产生的临时脚本，非项目原有文件
+| 项 | 说明 |
+|---|---|
+| `.env` | 含真实凭证，**已在 `.gitignore`，切勿提交** |
+| 凭证不能跨机器复制 | 绑定本机设备指纹 |
+| 写接口会作废 ticket | 失败后读能力也会中断 |
+| 限频 `error_code=7` | 服务端冷却，**反复重试会加重** |
+| `main.py` 第 4 段 | **会真的发私信**，别误触 |
+| 别动真实 profile | 曾有 Cookies 库被清空事故，见 [未解问题](状态/未解问题.md) Q4 |
+
+---
+
+## 适用判断
+
+| 你的目标 | 建议 |
+|---|---|
+| 采集作品 / 评论 / 直播数据 | ✅ **值得用**，读能力完整 |
+| 只要签名算法 | ✅ 抄 `secsdk_web_sign.py` + `ab_pure.py`，性价比极高 |
+| 自动化互动（点赞/评论/发布） | ❌ **不建议**，写接口不通且会连带作废会话 |
+| 长期生产使用 | ⚠️ 注意浏览器 App-Bound 会导致提取通道收窄 |
