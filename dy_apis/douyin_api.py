@@ -1574,59 +1574,45 @@ class DouyinAPI:
         return notice_list
 
     @staticmethod
-    def get_feed(auth, count='20', refresh_index='2', **kwargs):
-        """
-        获取首页推荐视频
+    def get_tab_feed(auth, count='10', refresh_index='1', **kwargs):
+        """获取首页「推荐」信息流（/aweme/v1/web/tab/feed/）。
+
+        旧的 /aweme/v1/web/module/feed/ 已废弃：实测 HTTP 200 + 空 body，
+        baseline / with_bd_readonly / with_bd / csrf+uifid 四种鉴权组合全部为空，
+        所以推荐流只有这一个入口。
+
         :param auth: DouyinAuth object.
-        :param count: 数量.
-        :param refresh_index: 刷新索引.
-        :return: JSON.
+        :param count: 请求条数。**这个参数不可靠**：实测请求 10 或 20 都只回来
+            2~6 条，实际返回条数由服务端决定。不要按 count 截断，也不要拿它
+            循环补数，服务端给多少就是多少。
+        :param refresh_index: 翻页凭据，不是页码、也不能当页码算。从 '1' 开始，
+            每刷新一轮 +1；实测 8 轮拿到 41 条唯一作品、零重复。传 str 或 int
+            都行，内部统一转成 str。
+        :param kwargs: 与其他接口保持一致的占位参数。
+        :return: 响应JSON，顶层键 aweme_list / has_more / log_pb / status_code。
+
+        注意：不同 refresh_index、不同次调用返回的作品都会重叠，
+        **调用方必须自己按 aweme_id 去重**，本方法不做任何去重。
         """
-        api = "/aweme/v1/web/module/feed/"
+        api = "/aweme/v1/web/tab/feed/"
         headers = HeaderBuilder().build(HeaderType.GET)
-        refer = "https://www.douyin.com/"
+        refer = "https://www.douyin.com/?recommend=1"
         headers.set_referer(refer)
+        headers.with_bd_readonly(auth)
+        headers.with_csrf(auth.cookie_str)
+        headers.with_uifid(auth)
         params = Params()
-        params.add_param("device_platform", 'webapp')
-        params.add_param("aid", '6383')
-        params.add_param("channel", 'channel_pc_web')
-        params.add_param("module_id", '3003101')
+        params.add_param("device_platform", "webapp")
+        params.add_param("aid", "6383")
+        params.add_param("channel", "channel_pc_web")
+        params.with_platform(round_trip_time='0')
         params.add_param("count", count)
-        params.add_param("filterGids", '')
-        params.add_param("presented_ids", '')
-        params.add_param("refresh_index", refresh_index)
-        params.add_param("refer_id", '')
-        params.add_param("refer_type", '10')
-        params.add_param("awemePcRecRawData", '{"is_client":false}')
-        params.add_param("Seo-Flag", '0')
-        params.add_param("install_time", '1715480185')
-        params.add_param("pc_client_type", '1')
-        params.add_param("update_version_code", '170400')
-        params.add_param("version_code", '170400')
-        params.add_param("version_name", '17.4.0')
-        params.add_param("cookie_enabled", 'true')
-        params.add_param("screen_width", get_profile()["screen_width"])
-        params.add_param("screen_height", get_profile()["screen_height"])
-        params.add_param("browser_language", 'zh-CN')
-        params.add_param("browser_platform", 'Win32')
-        params.add_param("browser_name", get_profile()["browser_name"])
-        params.add_param("browser_version", get_profile()["browser_version"])
-        params.add_param("browser_online", 'true')
-        params.add_param("engine_name", 'Blink')
-        params.add_param("engine_version", get_profile()["engine_version"])
-        params.add_param("os_name", 'Windows')
-        params.add_param("os_version", '10')
-        params.add_param("cpu_core_num", get_profile()["cpu_core_num"])
-        params.add_param("device_memory", get_profile()["device_memory"])
-        params.add_param("platform", 'PC')
-        params.add_param("downlink", '10')
-        params.add_param("effective_type", '4g')
-        params.add_param("round_trip_time", '100')
+        params.add_param("refresh_index", str(refresh_index))
         params.with_web_id(auth, refer)
+        params.with_uifid(auth)
+        params.with_verify_fp(auth)
         params.add_param("msToken", auth.msToken)
         params.with_a_bogus()
-        params.add_param("verifyFp", auth.cookie['s_v_web_id'])
-        params.add_param("fp", auth.cookie['s_v_web_id'])
 
         res = requests.get(f'{DouyinAPI.douyin_url}{api}', headers=headers.get(), params=params.get(),
                            cookies=auth.cookie, verify=False)
@@ -2080,7 +2066,7 @@ class DouyinAPI:
         params.add_param("downlink", '10')
         params.add_param("effective_type", '4g')
         # 实录 comment/publish 是 50；原来写死 200 是从老代码继承的孤例
-        # （全项目只有这里和 get_feed 不是 0/50，2026-08-22 值对账时发现）
+        # （2026-08-22 值对账时发现）
         params.add_param("round_trip_time", '50')
         params.with_web_id(auth, refer)
         if uifid:
@@ -2786,7 +2772,7 @@ if __name__ == '__main__':
     # print(DouyinAPI.get_some_user_follower_list(auth_, "3074704605975950", "MS4wLjABAAAA0L4jpkJDeuFO9AM-dQK1B649tmr7GIw-sQtyPasP_Z45QnUjIQgUOLIs8Kw8Gp-u", 40))
     # print(DouyinAPI.get_some_user_following_list(auth_, "3074704605975950", "MS4wLjABAAAA0L4jpkJDeuFO9AM-dQK1B649tmr7GIw-sQtyPasP_Z45QnUjIQgUOLIs8Kw8Gp-u", 40))
     # print(DouyinAPI.search_some_video_work(auth_, "巴旦木公主", 32))
-    # print(DouyinAPI.get_feed(auth_))
+    # print(DouyinAPI.get_tab_feed(auth_))
     # print(DouyinAPI.publish_comment(auth_, "7356193166732709139"))
     # print(DouyinAPI.get_upload_auth_key(auth_))
 
