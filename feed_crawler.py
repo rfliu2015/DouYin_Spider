@@ -54,6 +54,12 @@ COMMENT_LIMIT = 200        # 每作品最多取多少条一级评论（Q4）
 ROUND_DEADLINE = 3300      # 单轮硬超时（秒）。任务计划每小时一次，
                            # 留 5 分钟余量，避免上一轮没收尾就叠上下一轮。
 
+# 允许执行的时段（含边界）。任务计划已配了 06:05-22:05 的触发窗口，
+# 这里再加一层代码级防护：手动运行、系统补跑、或任务配置被误改时，
+# 凌晨也不会真的去打接口。
+ACTIVE_HOUR_START = 6
+ACTIVE_HOUR_END = 22
+
 
 def log(msg):
     """同时打到 stdout 和文件日志。
@@ -94,6 +100,12 @@ def _arm_round_deadline():
 
 def _deadline_hit():
     return _ROUND_TIMER["fired"]
+
+
+def _in_active_window(now=None):
+    """当前是否处于允许采集的时段。"""
+    h = (now or datetime.now()).hour
+    return ACTIVE_HOUR_START <= h <= ACTIVE_HOUR_END
 
 
 def _disarm_round_deadline():
@@ -365,10 +377,19 @@ def main(argv=None):
                     help="置信度阈值（默认 0.8）")
     ap.add_argument("--dry-run", action="store_true", help="不下载")
     ap.add_argument("--stats", action="store_true", help="只看统计")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略时段限制，强制运行")
     args = ap.parse_args(argv)
 
     if args.stats:
         return show_stats()
+
+    if not args.force and not _in_active_window():
+        log("当前 %s 不在采集时段（%d:00-%d:59），跳过。"
+            "如需强制运行加 --force"
+            % (datetime.now().strftime("%H:%M"),
+               ACTIVE_HOUR_START, ACTIVE_HOUR_END))
+        return 0
 
     log("=== 推荐流采集开始 ===")
     try:
