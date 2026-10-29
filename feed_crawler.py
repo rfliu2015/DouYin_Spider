@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -354,6 +355,100 @@ def run(args):
         store.close()
 
 
+# --------------------------------------------------------------- 单条入库
+
+def _parse_aweme_id(s):
+    """从分享链接或纯 ID 里取出 aweme_id。
+
+    支持：
+        https://www.douyin.com/video/7455720996486548795
+        https://www.douyin.com/discover?modal_id=7455720996486548795
+        https://v.douyin.com/xxxxx/   （短链，取不出时要求用户给完整链接）
+        7455720996486548795           （纯数字）
+    """
+    s = (s or "").strip()
+    if s.isdigit():
+        return s
+    m = re.search(r"/(?:video|note)/(\d{15,25})", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]modal_id=(\d{15,25})", s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def run_one(args):
+    """把一条指定作品按推荐流同样的流程处理：判定 → 下载 → 评论 → 入库。
+
+    与 run() 的区别只在「作品从哪来」：这里是用户指定的，不走推荐流，
+    因此也没有 refresh_index 翻页和跨轮去重（本来就是指定要采的）。
+    """
+    _ensure_dirs()
+    store = FeedStore(DB_PATH)
+    try:
+        aid = _parse_aweme_id(args.one)
+        if not aid:
+            log("无法从输入里解析出 aweme_id: %s" % args.one)
+            log("请给完整视频链接（含 /video/<id>）或纯数字 ID")
+            return 1
+        log("=== 单条采集 aweme_id=%s ===" % aid)
+
+        log("加载凭证…")
+        auth = load_env()
+
+        log("拉取作品详情…")
+        try:
+            detail = DouyinAPI.get_work_info(
+                auth, "https://www.douyin.com/video/%s" % aid)
+        except Exception as err:  # noqa: BLE001
+            log("拉取失败: %s" % str(err)[:200])
+            return 1
+        aw = detail.get("aweme_detail") or {}
+        if not aw:
+            log("作品详情为空，可能已删除、私密或链接有误")
+            return 1
+        log("  %s | %s" % ((aw.get("author") or {}).get("nickname"),
+                           (aw.get("desc") or "")[:50]))
+
+        # 判定
+        log("主题判定…")
+        themes_path = os.path.join(DATA_DIR, "themes.json")
+        themes = None
+        if os.path.exists(themes_path):
+            with open(themes_path, encoding="utf-8") as f:
+                themes = json.load(f)
+        classifier = TopicClassifier.from_env(
+            themes=themes, threshold=args.threshold)
+        try:
+            topics = classifier.classify_awemes([aw]).get(aid, [])
+        except ClassifierError as err:
+            log("判定失败: %s" % str(err)[:160])
+            log("（继续采集，主题留空）")
+            topics = []
+        if topics:
+            log("  命中: %s" % ", ".join(
+                "%s(%.2f)" % (t["name"], t["conf"]) for t in topics))
+        else:
+            log("  未命中任何主题")
+
+        # 入库（指定采集不因为低于阈值而跳过）
+        round_id = store.start_round()
+        store.save_aweme(aw, topics, args.threshold, round_id)
+        store.commit()
+
+        ok, n = download_one(auth, aw, store, round_id)
+        store.finish_round(round_id, fetched=1, classified=1,
+                           hit=1 if topics else 0,
+                           downloaded=1 if ok else 0, comments=n,
+                           note="manual")
+        log("=== 完成：视频 %s / 评论 %d 条 ==="
+            % ("已下载" if ok else "失败", n))
+        return 0 if ok else 1
+    finally:
+        store.close()
+
+
 def show_stats():
     if not os.path.exists(DB_PATH):
         print("数据库不存在: %s" % DB_PATH)
@@ -379,10 +474,21 @@ def main(argv=None):
     ap.add_argument("--stats", action="store_true", help="只看统计")
     ap.add_argument("--force", action="store_true",
                     help="忽略时段限制，强制运行")
+    ap.add_argument("--one", metavar="URL_OR_ID",
+                    help="只采集指定的一条作品（抖音链接或纯 aweme_id），"
+                         "按推荐流同样的流程判定+下载+评论+入库")
     args = ap.parse_args(argv)
 
     if args.stats:
         return show_stats()
+
+    if args.one:
+        log("=== 指定作品采集 ===")
+        try:
+            return run_one(args)
+        except Exception as err:  # noqa: BLE001
+            log("失败: %s: %s" % (type(err).__name__, err))
+            return 1
 
     if not args.force and not _in_active_window():
         log("当前 %s 不在采集时段（%d:00-%d:59），跳过。"
