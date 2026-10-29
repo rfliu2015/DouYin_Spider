@@ -62,6 +62,8 @@ BROWSERS = [
     ("Chrome", os.path.join(LOCAL, "Google", "Chrome", "User Data")),
     ("Edge Beta", os.path.join(LOCAL, "Microsoft", "Edge Beta", "User Data")),
     ("Chrome Beta", os.path.join(LOCAL, "Google", "Chrome Beta", "User Data")),
+    # 360 极速浏览器：Chromium 内核但走传统 DPAPI + v10，不启用 App-Bound。
+    ("360 ChromeX", r"D:\Software\0-9\360ExtremeBrowser\360ChromeX\Chrome\User Data"),
 ]
 
 LEVELDB_REL = os.path.join("Local Storage", "leveldb")
@@ -250,26 +252,69 @@ def extract_private_key(blobs, known_pub_b64=None):
     return None, None, None
 
 
-def extract_ticket_and_sign(blobs):
-    """从 sign_data_key/web_protect 提取 ticket 与 ts_sign。"""
-    ticket = None
-    ts_sign = None
+_ESC_QUOTE = chr(92) + '"'   # leveldb 把 JSON 值里的 " 存成反斜杠+引号
+
+
+def _iter_sign_records(blobs):
+    """产出 leveldb 里所有 s_sdk_sign_data_key 的 JSON 记录。"""
     for _name, data in blobs:
-        i = data.find(b"sign_data_key/web_protect")
-        if i < 0:
+        i = data.find(b"s_sdk_sign_data_key/")
+        while i >= 0:
+            seg = data[i:i + 1600].decode("latin-1").replace(_ESC_QUOTE, '"')
+            j = seg.find('{"ticket"')
+            if j >= 0:
+                k = seg.find("}", j)
+                if k > j:
+                    try:
+                        obj = json.loads(seg[j:k + 1])
+                    except Exception:
+                        obj = None
+                    if obj:
+                        yield obj
+            i = data.find(b"s_sdk_sign_data_key/", i + 1)
+
+
+def extract_ticket_and_sign(blobs, known_pub_b64=None):
+    """从 leveldb 提取 ticket / ts_sign / client_cert。
+
+    两代格式并存，必须都扫：
+      新版  security-sdk/s_sdk_sign_data_key/<scope>  -> 一整段 JSON
+      旧版  sign_data_key/web_protect                 -> 二进制里散落 hash./ts.
+    旧版锚点常被 leveldb 前缀压缩切断（只剩 .../web_protect），所以按后缀匹配。
+
+    同一 profile 会残留多份历史记录，各自绑着不同的私钥。注入错的那份
+    服务端会认为 ticket 与私钥不匹配，写接口必失败——因此用 client_cert
+    与已推导公钥的匹配度打分，再用 create_time 兜底取最新。
+    """
+    known = (known_pub_b64 or "").strip()
+    cands = []
+
+    for obj in _iter_sign_records(blobs):
+        ticket = obj.get("ticket") or ""
+        ts_sign = obj.get("ts_sign") or ""
+        if not ticket.startswith("hash.") or not ts_sign.startswith("ts."):
             continue
-        seg = data[i:i + 2000].decode("latin-1")
-        if not ticket:
-            m = re.search(r"hash\.[A-Za-z0-9+/=]{20,}", seg)
-            if m:
-                ticket = m.group()
-        if not ts_sign:
-            m = re.search(r"ts\.\d+\.[0-9a-fA-F]{40,}", seg)
-            if m:
-                ts_sign = m.group()
-        if ticket and ts_sign:
-            break
-    return ticket, ts_sign
+        cands.append((ticket, ts_sign, obj.get("client_cert") or "",
+                      obj.get("create_time") or 0))
+
+    for _name, data in blobs:
+        for m in re.finditer(b"web_protect", data):
+            seg = data[m.start():m.start() + 900].decode("latin-1")
+            t = re.search(r"hash\.[A-Za-z0-9+/=]{20,}", seg)
+            s = re.search(r"ts\.\d+\.[0-9a-fA-F]{40,}", seg)
+            if t and s:
+                cands.append((t.group(), s.group(), "", 0))
+
+    if not cands:
+        return None, None, None
+
+    def rank(c):
+        cert = c[2]
+        matched = 1 if (known and cert and cert == "pub." + known) else 0
+        return (matched, c[3])
+
+    best = max(cands, key=rank)
+    return best[0], best[1], (best[2] or None)
 
 
 # ---------------------------------------------------------------- cookie 提取
@@ -313,9 +358,25 @@ def _aes_key_from_local_state(local_state_path):
 _COOKIE_APP_BOUND_PREFIX = 32
 
 
+# Chromium 127+ 的 App-Bound 加密：cookie 前缀是 v20，主密钥由 SYSTEM 级
+# DPAPI 保护（os_crypt.app_bound_encrypted_key），普通用户解不开。
+# 这类值绝不能当作明文返回——那样会得到一串看似有值的乱码，让调用方误以为
+# 提取成功（实测 Edge 156 的 62 个 cookie 全部如此）。
+_COOKIE_APP_BOUND_PREFIXES = (b"v20", b"v21")
+
+
+class AppBoundEncryption(RuntimeError):
+    """cookie 使用了 App-Bound 加密，当前用户无法解密。"""
+
+
 def _decrypt_cookie_value(encrypted, key):
     if not encrypted:
         return ""
+    if encrypted[:3] in _COOKIE_APP_BOUND_PREFIXES:
+        raise AppBoundEncryption(
+            "cookie 使用 App-Bound 加密（%s），主密钥受 SYSTEM 级 DPAPI 保护，"
+            "当前用户无法解密；请改用未启用该加密的浏览器"
+            % encrypted[:3].decode("latin-1"))
     if encrypted[:3] in (b"v10", b"v11"):
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         nonce = encrypted[3:15]
@@ -388,11 +449,18 @@ def extract_cookies(profile_dir):
             pass
 
     out = {}
+    app_bound = 0
     for _host, name, enc in rows:
         try:
             out[name] = _decrypt_cookie_value(enc, key)
+        except AppBoundEncryption:
+            app_bound += 1
         except Exception:
             continue
+    if app_bound and not out:
+        raise AppBoundEncryption(
+            "该 profile 的 %d 个 cookie 全部是 App-Bound 加密（v20），无法解密。"
+            "换用未启用该加密的浏览器（如 360 极速 / 传统 Chrome）。" % app_bound)
     return out
 
 
@@ -444,8 +512,8 @@ def harvest(leveldb_dir, with_cookies=True):
 
     known_pub = public_key_from_cookie(blobs)
     sk, raw, derived = extract_private_key(blobs, known_pub)
-    ticket, ts_sign = extract_ticket_and_sign(blobs)
-    client_cert = extract_client_cert(blobs)
+    ticket, ts_sign, cert_from_record = extract_ticket_and_sign(blobs, derived or known_pub)
+    client_cert = cert_from_record or extract_client_cert(blobs)
 
     got = {}
     if sk is not None:
