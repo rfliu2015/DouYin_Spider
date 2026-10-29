@@ -51,16 +51,60 @@ REFRESH_ROUNDS = 10        # 每轮刷几屏（Q3）
 MAX_DOWNLOAD = 20          # 每轮最多下载几条（Q3）
 CLASSIFY_BATCH = 20        # 每次送模型多少条
 COMMENT_LIMIT = 200        # 每作品最多取多少条一级评论（Q4）
+ROUND_DEADLINE = 3300      # 单轮硬超时（秒）。任务计划每小时一次，
+                           # 留 5 分钟余量，避免上一轮没收尾就叠上下一轮。
 
 
 def log(msg):
+    """同时打到 stdout 和文件日志。
+
+    定时任务模式下 stdout 无人接收，只看得到文件日志——所以这里必须
+    双写，否则排查线上问题时日志是空的。
+    """
     ts = datetime.now().strftime("%H:%M:%S")
     print("[%s] %s" % (ts, msg), flush=True)
+    _file_log(msg)
 
 
 def _ensure_dirs():
     for d in (DATA_DIR, MEDIA_DIR, COMMENT_DIR, LOG_DIR):
         os.makedirs(d, exist_ok=True)
+
+
+_ROUND_TIMER = {"handle": None, "fired": False}
+
+
+def _arm_round_deadline():
+    """给整轮加软超时。
+
+    Windows 没有 signal.SIGALRM，所以用 threading.Timer 起一个看门狗线程，
+    到点置标志位。真正的阻塞点（requests 无 timeout）杀不掉，但可以让主流程
+    在下一个检查点主动收尾，不至于被 IgnoreNew 策略永久挡住后续轮次。
+    """
+    import threading
+
+    def _fire():
+        _ROUND_TIMER["fired"] = True
+
+    t = threading.Timer(ROUND_DEADLINE, _fire)
+    t.daemon = True
+    t.start()
+    _ROUND_TIMER["handle"] = t
+
+
+def _deadline_hit():
+    return _ROUND_TIMER["fired"]
+
+
+def _disarm_round_deadline():
+    t = _ROUND_TIMER.get("handle")
+    if t is not None:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    _ROUND_TIMER["handle"] = None
+    _ROUND_TIMER["fired"] = False
 
 
 def _file_log(msg):
@@ -96,6 +140,9 @@ def fetch_feed(auth, rounds=REFRESH_ROUNDS):
         log("  第 %d 屏: %d 条，新增 %d，累计 %d" % (ri, len(items), added, len(seen)))
         if not items:
             break
+        if _deadline_hit():
+            log("  已达单轮时限，停止抓取")
+            break
         time.sleep(1)
     return list(seen.values())
 
@@ -128,11 +175,34 @@ def download_one(auth, aw, store, round_id):
 
     ok = False
     try:
-        download_work(work_info, MEDIA_DIR, "media")
-        ok = True
-        log("  %s 视频已下载" % aid)
+        # data_util.download_media() 用原生 requests 且没设 timeout，
+        # 单条视频可能永久阻塞。Windows 没有 SIGALRM，改为把 download_work
+        # 丢进子线程，主线程 join 180 秒；超时就放弃该条继续下一条。
+        # 泄漏的下载线程自身有守护属性，不会阻止进程退出。
+        import threading
+
+        box = {}
+
+        def _do():
+            try:
+                download_work(work_info, MEDIA_DIR, "media")
+                box["ok"] = True
+            except Exception as exc:  # noqa: BLE001
+                box["err"] = exc
+
+        th = threading.Thread(target=_do, daemon=True)
+        th.start()
+        th.join(180)
+        if th.is_alive():
+            log("  %s 视频下载超时（180s），跳过" % aid)
+        elif box.get("ok"):
+            ok = True
+            log("  %s 视频已下载" % aid)
+        else:
+            log("  %s 视频下载失败: %s"
+                % (aid, str(box.get("err"))[:120]))
     except Exception as err:  # noqa: BLE001
-        log("  %s 视频下载失败: %s" % (aid, str(err)[:120]))
+        log("  %s 视频下载异常: %s" % (aid, str(err)[:120]))
 
     n_comment = 0
     try:
@@ -159,6 +229,7 @@ def download_one(auth, aw, store, round_id):
 
 def run(args):
     _ensure_dirs()
+    _arm_round_deadline()
     store = FeedStore(DB_PATH)
     round_id = store.start_round()
     counts = {"fetched": 0, "classified": 0, "hit": 0,
@@ -248,6 +319,9 @@ def run(args):
         to_download = to_download[:args.max_download]
         log("开始采集 %d 条…" % len(to_download))
         for aw, topics in to_download:
+            if _deadline_hit():
+                log("  已达单轮时限，停止采集")
+                break
             aid = aw.get("aweme_id")
             conf = max((t["conf"] for t in topics), default=0)
             topic = topics[0]["name"] if topics else "-"
@@ -264,6 +338,7 @@ def run(args):
         _file_log("round done: %s" % json.dumps(counts, ensure_ascii=False))
         return 0
     finally:
+        _disarm_round_deadline()
         store.close()
 
 
@@ -300,11 +375,12 @@ def main(argv=None):
         code = run(args)
     except RuntimeError as err:
         log("中止: %s" % err)
-        _file_log("abort: %s" % err)
         code = 1
+    except TimeoutError as err:
+        log("超出单轮时限，强制收尾: %s" % err)
+        code = 2
     except Exception as err:  # noqa: BLE001
         log("未预期错误: %s: %s" % (type(err).__name__, err))
-        _file_log("error: %s: %s" % (type(err).__name__, err))
         code = 1
     log("=== 结束，exit=%d ===" % code)
     return code
