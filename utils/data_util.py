@@ -25,6 +25,23 @@ def timestamp_to_str(timestamp):
 
 
 
+def _image_urls(images):
+    """把 images 归一成 URL 列表.
+
+    图文作品的 images 元素是 dict（url_list / download_url_list / uri / width …），
+    早先直接把元素当字符串 join，图集一律 TypeError（2026-10-29 实测 note 链接）。
+    """
+    urls = []
+    for item in images or []:
+        if isinstance(item, dict):
+            url_list = item.get('url_list') or item.get('download_url_list') or []
+            if url_list:
+                urls.append(url_list[0])
+        elif isinstance(item, str) and item:
+            urls.append(item)
+    return urls
+
+
 def handle_work_info(data):
     sec_uid = data['author']['sec_uid']
     user_url = f'https://www.douyin.com/user/{sec_uid}'
@@ -61,6 +78,7 @@ def handle_work_info(data):
     images = data['images']
     if not isinstance(images, list):
         images = []
+    images = _image_urls(images)
     create_time = data['create_time']
 
     text_extra = data['text_extra'] if 'text_extra' in data else []
@@ -71,12 +89,17 @@ def handle_work_info(data):
         if hashtag_name:
             topics.append(hashtag_name)
 
+    # aweme_type=68 / media_type=2 都是图文；图文的 video 字段指向
+    # images_no_sound_volume_audio_file.mp3 这种占位音频，不是真视频，
+    # 所以类型判定不能只看 video 是否存在。
     work_type = '未知'
-    if 'aweme_type' in data:
-        if data['aweme_type'] == 68:
-            work_type = '图集'
-        elif data['aweme_type'] == 0:
-            work_type = '视频'
+    aweme_type = data.get('aweme_type')
+    if aweme_type == 68 or data.get('media_type') == 2:
+        work_type = '图集'
+    elif aweme_type == 0:
+        work_type = '视频'
+    elif images:
+        work_type = '图集'
 
     return {
         'work_id': aweme_id,
@@ -126,12 +149,16 @@ MEDIA_HEADERS = {'Referer': 'https://www.douyin.com/'}
 
 def download_media(path, name, url, type):
     if type == 'image':
-        res = requests.get(url, headers=MEDIA_HEADERS)
+        res = requests.get(url, headers=MEDIA_HEADERS, timeout=60)
         res.raise_for_status()
-        with open(path + '/' + name + '.jpg', mode="wb") as f:
+        # 图文图片 CDN 返回 webp，早先一律存成 .jpg，内容与后缀对不上。
+        ct = (res.headers.get('content-type') or '').split(';')[0].strip()
+        ext = {'image/webp': '.webp', 'image/png': '.png',
+               'image/gif': '.gif', 'image/jpeg': '.jpg'}.get(ct, '.jpg')
+        with open(path + '/' + name + ext, mode="wb") as f:
             f.write(res.content)
     elif type == 'video':
-        res = requests.get(url, headers=MEDIA_HEADERS, stream=True)
+        res = requests.get(url, headers=MEDIA_HEADERS, stream=True, timeout=60)
         res.raise_for_status()
         size = 0
         chunk_size = 1024 * 1024
@@ -190,6 +217,8 @@ def download_work(work_info, path, save_choice):
     work_type = work_info['work_type']
     save_wrok_detail(work_info, save_path)
     if work_type == '图集' and save_choice in ['media', 'media-image', 'all']:
+        if not work_info['images']:
+            raise RuntimeError('图集作品没有解析出任何图片 URL')
         for img_index, img_url in enumerate(work_info['images']):
             download_media(save_path, f'image_{img_index}', img_url, 'image')
     elif work_type == '视频' and save_choice in ['media', 'media-video', 'all']:

@@ -8,6 +8,7 @@
   漏召：钢琴曲没有"艺术"字样、荣格心理学没有"读书"字样；
   硬失效：约 10% 的作品 desc 为空且取不到作者信息。
 
+服务商：优先火山方舟 Ark（ARK_*），无 ARK_API_KEY 时回退 LongCat（LONGCAT_*）。
 实测（LongCat-2.5-Preview，8 条真实样本）：
   明显正确 6/8，边缘可争议 2/8，明显错误 0/8。
 
@@ -21,6 +22,7 @@
 3. 强制 JSON 输出，temperature=0 保证可复现。
 4. 该模型是**推理模型**，响应里有 reasoning_content，只读 content。
 5. 失败不降级：Key 缺失直接抛错，判定失败由调用方决定跳过本轮。
+6. 双服务商：ARK_* 优先、LONGCAT_* 兜底，都走 OpenAI 兼容的 chat/completions。
 
 用法
 ----
@@ -42,8 +44,9 @@ class ClassifierError(RuntimeError):
 # 主题定义。反例条款是准确率关键——实测中模型正是靠"作者名含AI不算"
 # 排除了游戏作者、靠"心理学算读书"命中了荣格那条。
 #
-# 注意「心理学」与「读书」的边界：心理学独立成主题后，读书不再包含心理学，
-# 但"心理学书籍的书评"会同时命中两者——这是预期的多标签行为，不是冲突。
+# 注意「心理学」与「为人处世」的边界：二者在"社交焦虑""情绪处理"上有重叠，
+# 同时命中是预期的多标签行为。区别在于为人处世偏"怎么做"（社交规则、进退分寸），
+# 心理学偏"为什么"（心理机制、人格理论）。
 DEFAULT_THEMES = [
     {
         "name": "AI技术",
@@ -57,17 +60,14 @@ DEFAULT_THEMES = [
         "neg": "音乐榜单八卦、明星绯闻不算。",
     },
     {
-        "name": "读书",
-        "desc": "书籍推荐、书评、名著解读、作者介绍、阅读方法、哲学、思想类内容。",
-        "neg": "影视剧解说原著不算（属影视）；纯历史事件叙述不算；"
-               "心理学内容归「心理学」主题，不在此列。",
-    },
-    {
-        "name": "人际关系",
-        "desc": "沟通技巧、社交能力、恋爱与婚姻、亲密关系、职场关系、"
-                "家庭关系、冲突处理、情商、社交焦虑、人脉经营。",
+        "name": "为人处世",
+        "desc": "处世智慧、人情世故、社交规则、沟通技巧、情商、"
+                "职场生存、识人辨人、利益权衡、为人做事的分寸与进退、"
+                "社会经验与生存法则、人际冲突的化解方式。",
         "neg": "纯情感八卦、明星绯闻、狗血剧情解说不算；"
-               "只有剧情冲突的影视解说不算。",
+               "只讲剧情冲突的影视解说不算；"
+               "空泛励志口号与成功学鸡汤不算；"
+               "纯心理学理论归「心理学」主题，不在此列。",
     },
     {
         "name": "心理学",
@@ -81,6 +81,23 @@ DEFAULT_THEMES = [
 
 DESC_MAX_LEN = 120
 TAG_MAX = 6
+
+
+def _resolve_provider():
+    """选出实际使用的服务商：(名字, base_url, model, api_key)。
+
+    Ark 优先；ARK_API_KEY 未配置（或为空）时回退 LongCat。两者都缺则返回
+    Ark 的空值，由构造函数抛出可读的报错。
+    """
+    if (os.getenv("ARK_API_KEY") or "").strip():
+        return ("Ark",
+                os.getenv("ARK_BASE_URL"),
+                os.getenv("ARK_MODEL"),
+                os.getenv("ARK_API_KEY"))
+    return ("LongCat",
+            os.getenv("LONGCAT_BASE_URL"),
+            os.getenv("LONGCAT_MODEL"),
+            os.getenv("LONGCAT_API_KEY"))
 
 
 def _build_system_prompt(themes):
@@ -120,11 +137,14 @@ class TopicClassifier:
     def __init__(self, base_url, model, api_key, themes=None,
                  threshold=0.8, timeout=180, max_retries=1):
         if not base_url:
-            raise ClassifierError("缺少 base_url（检查 .env 的 LONGCAT_BASE_URL）")
+            raise ClassifierError(
+                "缺少 base_url（检查 .env 的 ARK_BASE_URL / LONGCAT_BASE_URL）")
         if not api_key:
-            raise ClassifierError("缺少 api_key（检查 .env 的 LONGCAT_API_KEY）")
+            raise ClassifierError(
+                "缺少 api_key（检查 .env 的 ARK_API_KEY / LONGCAT_API_KEY）")
         if not model:
-            raise ClassifierError("缺少 model（检查 .env 的 LONGCAT_MODEL）")
+            raise ClassifierError(
+                "缺少 model（检查 .env 的 ARK_MODEL / LONGCAT_MODEL）")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -139,18 +159,29 @@ class TopicClassifier:
     def from_env(cls, env_path=None, **kwargs):
         """从 .env 构造。缺 Key 直接抛错，绝不静默降级为关键词匹配。
 
+        优先用 ARK_*（火山方舟），没有 ARK_API_KEY 时才回退到 LONGCAT_*。
+        2026-10-30 起 LongCat 两个模型都返回 402（配额耗尽），故 Ark 为主线路，
+        LongCat 配置保留不删，删掉 ARK_API_KEY 即可原样切回。
+
         显式传入的 threshold 优先于 .env 里的 TOPIC_THRESHOLD。
         """
         from dotenv import load_dotenv
         load_dotenv(env_path, override=bool(env_path))
         if kwargs.get("threshold") is None:
             kwargs["threshold"] = float(os.getenv("TOPIC_THRESHOLD") or 0.8)
-        return cls(
-            base_url=os.getenv("LONGCAT_BASE_URL"),
-            model=os.getenv("LONGCAT_MODEL"),
-            api_key=os.getenv("LONGCAT_API_KEY"),
-            **kwargs
-        )
+        provider, base_url, model, api_key = _resolve_provider()
+        return cls(base_url=base_url, model=model, api_key=api_key, **kwargs)
+
+    @staticmethod
+    def has_signal(aw):
+        """这条作品是否有可送模型的文本信号（desc 或话题至少有一个）。
+
+        没有信号的条目在 prepare_items 里会被丢弃，永远不可能命中主题；
+        调用方据此把它们从"已判定"计数里剔除，免得统计虚高。
+        """
+        if (aw.get("desc") or "").strip():
+            return True
+        return any(t.get("hashtag_name") for t in (aw.get("text_extra") or []))
 
     @staticmethod
     def prepare_items(awemes, start_index=1):
