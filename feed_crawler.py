@@ -52,6 +52,9 @@ REFRESH_ROUNDS = 10        # 每轮刷几屏（Q3）
 MAX_DOWNLOAD = 20          # 每轮最多下载几条（Q3）
 CLASSIFY_BATCH = 20        # 每次送模型多少条
 COMMENT_LIMIT = 200        # 每作品最多取多少条一级评论（Q4）
+REPLY_THROTTLE = 1.5       # 补抓二级回复的间隔（秒）。一条作品常有 30+ 条
+                           # 带回复的评论，连发极易撞 error_code=7。
+REPLY_LIMIT = 200          # 每条一级评论最多保留多少条回复
 ROUND_DEADLINE = 3300      # 单轮硬超时（秒）。任务计划每小时一次，
                            # 留 5 分钟余量，避免上一轮没收尾就叠上下一轮。
 
@@ -162,6 +165,44 @@ def fetch_feed(auth, rounds=REFRESH_ROUNDS):
 
 # --------------------------------------------------------------- 下载
 
+def _fill_replies(auth, comments, aid):
+    """给一级评论补抓全部二级回复，写回 reply_comment。
+
+    comment/list/ 返回的 reply_comment 只是**预览**（实测某条 total=59 却只带
+    0~3 条），真正的回复要打 comment/list/reply/。dy_apis 里已有
+    get_work_all_comment() 做同样的事，但它没有节流也没有容错——单条失败就
+    整批中断。这里逐条抓、失败只跳过该条，并留出间隔避免 error_code=7。
+    """
+    todo = [c for c in comments if int(c.get("reply_comment_total") or 0) > 0]
+    if not todo:
+        return
+    log("  %s 补抓二级回复：%d 条评论带回复" % (aid, len(todo)))
+    got = 0
+    for i, c in enumerate(todo):
+        try:
+            reps = DouyinAPI.get_work_all_inner_comment(auth, c)
+            # comment/list/reply 翻页会重叠：实测某条 total=13 抓到 13 条里
+            # 有 2 条重复（唯一 11 条）。按 cid 去重，否则存储层 INSERT OR
+            # IGNORE 会静默吞掉，条数比 JSON 少、对不上。
+            seen, uniq = set(), []
+            for r in reps:
+                cid = r.get("cid")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    uniq.append(r)
+            c["reply_comment"] = uniq[:REPLY_LIMIT]
+            got += len(c["reply_comment"])
+        except Exception as err:  # noqa: BLE001
+            # 保留接口自带的预览回复，不要清空
+            log("    cid=%s 回复抓取失败，保留预览: %s"
+                % (c.get("cid"), str(err)[:90]))
+        if i + 1 < len(todo):
+            time.sleep(REPLY_THROTTLE)
+    log("  %s 二级回复 %d 条（%d/%d 条评论成功）"
+        % (aid, got, len([c for c in todo if len(c.get("reply_comment") or [])]),
+           len(todo)))
+
+
 def download_one(auth, aw, store, round_id):
     """下载视频 + 抓评论。返回 (ok, comment_count)。"""
     from utils.data_util import download_work, handle_work_info
@@ -222,6 +263,7 @@ def download_one(auth, aw, store, round_id):
         url = "https://www.douyin.com/video/%s" % aid
         comments = DouyinAPI.get_work_all_out_comment(auth, url)
         comments = comments[:COMMENT_LIMIT]
+        _fill_replies(auth, comments, aid)
         n_comment = store.save_comments(aid, comments)
         store.commit()
         # 原始评论另存一份，便于人工查看
@@ -298,7 +340,14 @@ def run(args):
                 return 1
             log("  批次 %d: %d 条有主题" % (i // CLASSIFY_BATCH + 1, len(got)))
             time.sleep(1)
-        counts["classified"] = len(fresh)
+        # 空壳（desc 空且无话题）在 prepare_items 里就被丢掉，永远不会命中，
+        # 不能算进"已判定"——否则统计里的判定量比实际送模型的多出一截
+        # （2026-10-30 实测一轮：15 条新作品里 5 条是空壳，占 1/3）。
+        signaled = [aw for aw in fresh if classifier.has_signal(aw)]
+        counts["classified"] = len(signaled)
+        if len(signaled) < len(fresh):
+            log("其中 %d 条无 desc 也无话题，跳过判定"
+                % (len(fresh) - len(signaled)))
 
         # 4. 落元数据 + 分流
         to_download = []
@@ -357,24 +406,58 @@ def run(args):
 
 # --------------------------------------------------------------- 单条入库
 
+def _resolve_short_link(url):
+    """跟随短链跳转，拿到最终的 /video/ 或 /note/ 地址。
+
+    抖音 App 的"复制链接"给的是 v.douyin.com 短链，302 两次才落到
+    www.douyin.com/note/<id>（图文）或 /video/<id>（视频）。
+    """
+    import requests
+
+    resp = requests.get(url, allow_redirects=True, timeout=20, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36",
+    })
+    return resp.url
+
+
 def _parse_aweme_id(s):
-    """从分享链接或纯 ID 里取出 aweme_id。
+    """从分享链接、App 分享文案或纯 ID 里取出 aweme_id。
 
     支持：
         https://www.douyin.com/video/7455720996486548795
+        https://www.douyin.com/note/7455720996486548795   （图文）
         https://www.douyin.com/discover?modal_id=7455720996486548795
-        https://v.douyin.com/xxxxx/   （短链，取不出时要求用户给完整链接）
+        8.94 复制打开抖音，看看【xx的作品】... https://v.douyin.com/xxxxx/
+            —— App "复制链接"的整段文案，URL 前后还带着分享码，直接粘进来即可
         7455720996486548795           （纯数字）
     """
     s = (s or "").strip()
     if s.isdigit():
         return s
-    m = re.search(r"/(?:video|note)/(\d{15,25})", s)
+
+    # App 分享文案里 URL 混在中文和分享码之间，先把 URL 抠出来
+    m = re.search(r"https?://\S+", s)
+    if m:
+        s = m.group(0)
+
+    m = re.search(r"/(?:video|note|slides)/(\d{15,25})", s)
     if m:
         return m.group(1)
     m = re.search(r"[?&]modal_id=(\d{15,25})", s)
     if m:
         return m.group(1)
+
+    # 短链：自己解析不了，跟随跳转后再抠一次
+    if "v.douyin.com" in s:
+        try:
+            final = _resolve_short_link(s)
+        except Exception as err:  # noqa: BLE001
+            log("短链解析失败: %s" % str(err)[:120])
+            return None
+        log("  短链跳转 -> %s" % final)
+        return _parse_aweme_id(final)
     return None
 
 
@@ -438,7 +521,8 @@ def run_one(args):
         store.commit()
 
         ok, n = download_one(auth, aw, store, round_id)
-        store.finish_round(round_id, fetched=1, classified=1,
+        store.finish_round(round_id, fetched=1,
+                           classified=1 if classifier.has_signal(aw) else 0,
                            hit=1 if topics else 0,
                            downloaded=1 if ok else 0, comments=n,
                            note="manual")
