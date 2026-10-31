@@ -51,7 +51,9 @@ LOG_DIR = os.path.join(DATA_DIR, "logs")
 REFRESH_ROUNDS = 10        # 每轮刷几屏（Q3）
 MAX_DOWNLOAD = 20          # 每轮最多下载几条（Q3）
 CLASSIFY_BATCH = 20        # 每次送模型多少条
-COMMENT_LIMIT = 200        # 每作品最多取多少条一级评论（Q4）
+COMMENT_LIMIT = 1000       # 每作品最多取多少条一级评论（原 Q4 定为 200）。
+                           # 200 会截断热门作品：实测 760 评论的那条一级就有
+                           # 约 440 条，只取到 200 条、漏掉近半。
 REPLY_THROTTLE = 1.5       # 补抓二级回复的间隔（秒）。一条作品常有 30+ 条
                            # 带回复的评论，连发极易撞 error_code=7。
 REPLY_LIMIT = 200          # 每条一级评论最多保留多少条回复
