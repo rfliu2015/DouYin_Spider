@@ -278,12 +278,13 @@ class DouyinAPI:
         return result
 
     @staticmethod
-    def get_work_out_comment(auth, url: str, cursor: str = '0', **kwargs) -> dict:
+    def get_work_out_comment(auth, url: str, cursor: str = '0', count: str = '5', **kwargs) -> dict:
         """
-        获取作品的全部一级评论.
+        获取作品的一级评论（单页）.
         :param auth: DouyinAuth object.
         :param url: 作品URL.
         :param cursor: 评论游标.
+        :param count: 每页条数. 浏览器实际用 10~20，默认沿用 5 保持旧行为。
         :return: JSON.
         """
         api = f"/aweme/v1/web/comment/list/"
@@ -299,7 +300,7 @@ class DouyinAPI:
         params.add_param("channel", "channel_pc_web")
         params.add_param("aweme_id", aweme_id)
         params.add_param("cursor", cursor)
-        params.add_param("count", "5")
+        params.add_param("count", count)
         params.add_param("item_type", "0")
         # whale_cut_token / rcFT 是**空值字段**，浏览器确实发（`whale_cut_token=&...&rcFT=`）。
         # 别再用 parse_qsl 的默认行为去判断"浏览器发没发"——它会静默丢掉空值字段。
@@ -320,17 +321,18 @@ class DouyinAPI:
         return resp_json
 
     @staticmethod
-    def get_work_all_out_comment(auth, url: str, **kwargs) -> list:
+    def get_work_all_out_comment(auth, url: str, count: str = '5', **kwargs) -> list:
         """
         获取作品全部一级评论.
         :param auth: DouyinAuth object.
         :param url: 作品URL.
+        :param count: 每页条数（默认 5，保持旧行为）.
         :return:
         """
         cursor = "0"
         comment_list = []
         while True:
-            res_json = DouyinAPI.get_work_out_comment(auth, url, cursor)
+            res_json = DouyinAPI.get_work_out_comment(auth, url, cursor, count)
             comments = res_json["comments"]
             cursor = str(res_json["cursor"])
             if comments is None or len(comments) == 0:

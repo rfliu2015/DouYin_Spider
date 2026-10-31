@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -54,9 +55,31 @@ CLASSIFY_BATCH = 20        # 每次送模型多少条
 COMMENT_LIMIT = 1000       # 每作品最多取多少条一级评论（原 Q4 定为 200）。
                            # 200 会截断热门作品：实测 760 评论的那条一级就有
                            # 约 440 条，只取到 200 条、漏掉近半。
-REPLY_THROTTLE = 1.5       # 补抓二级回复的间隔（秒）。一条作品常有 30+ 条
-                           # 带回复的评论，连发极易撞 error_code=7。
+COMMENT_PAGE_SIZE = '20'   # 一级评论每页条数。浏览器实际用 10~20；上游
+                           # dy_apis 硬编码 5，翻页次数是这里的 4 倍。
+COMMENT_THROTTLE = 1.0     # 一级评论翻页间隔（秒）。上游完全没有 sleep，
+                           # 一条千条评论的作品会连打 200 次，是风控主因。
+REPLY_DELAY_MIN = 0.5      # 回复请求的随机延迟下限（秒）
+REPLY_DELAY_MAX = 2.0      # 回复请求的随机延迟上限（秒）。固定间隔的请求
+                           # 节奏太规律，抖动更像真人、也避免踩同一时间窗。
+REPLY_ABORT_AFTER = 5      # 连续失败几次就放弃剩余回复。被风控时接口返回
+                           # 空响应（HTTP 200），继续打点只会加重封禁风险。
+                           # 取 5 是为了让指数回退有充分试探余地：2→4→8→16
+                           # 共 30 秒冷却仍不恢复，才判定为真风控。
+REPLY_BACKOFF_BASE = 2.0   # 连续失败后的指数回退起始秒数：2 → 4 → 8 → 16
+REPLY_BACKOFF_MAX = 60.0   # 回退封顶（秒），避免等太久
 REPLY_LIMIT = 200          # 每条一级评论最多保留多少条回复
+REPLY_TOP_PCT = 0.45       # 只抓「按点赞排序前 45%」的一级评论下的回复。
+                           # 实测 digg 前 30% 覆盖 69% 的回复量，前 50% 覆盖
+                           # 81%；取 45% 是覆盖度与请求量的折中。
+                           # 设为 1.0 即抓全部（回到旧行为）。
+REPLY_BUDGET = 35          # 单条作品的回复请求数硬上限（0 = 不限）。这是唯一
+                           # 能保证请求量的手段：无论作品多大，最多发这么多次。
+                           # ⚠️ 它**不是风控的解决方案**：实测同一 IP 上触发点
+                           # 随累计消耗下降（预算 100 时第 42 次、预算 35 时
+                           # 第 16 次），连发就会挂、单发能过，是间歇性的。
+                           # 取 35 只是"少发请求、减小影响面"；要稳定采集
+                           # 必须换 IP（feed_crawler 尚未接入 proxies）。
 ROUND_DEADLINE = 3300      # 单轮硬超时（秒）。任务计划每小时一次，
                            # 留 5 分钟余量，避免上一轮没收尾就叠上下一轮。
 
@@ -167,45 +190,166 @@ def fetch_feed(auth, rounds=REFRESH_ROUNDS):
 
 # --------------------------------------------------------------- 下载
 
-def _fill_replies(auth, comments, aid):
-    """给一级评论补抓全部二级回复，写回 reply_comment。
+def _fetch_all_out_comments(auth, url, aid=None):
+    """自己翻页拉一级评论，可控每页条数与间隔。
+
+    不复用 dy_apis.get_work_all_out_comment()：它是通用 API 层，翻页
+    count 硬编码 5 且**完全没有 sleep**。实测一条 1000 条一级评论的作品，
+    那等于连续打约 200 次请求，是触发风控的主因（回复那边有 1.5 秒节流，
+    反而比它温和）。把节奏控制留在采集器里，不动通用层的默认行为。
+    """
+    cursor = "0"
+    out = []
+    pages = 0
+    while True:
+        res = DouyinAPI.get_work_out_comment(auth, url, cursor, COMMENT_PAGE_SIZE)
+        pages += 1
+        comments = res.get("comments") or []
+        if not comments:
+            break
+        out.extend(comments)
+        # 提前退出：够量就不再翻页，省下的请求都是风控额度
+        if len(out) >= COMMENT_LIMIT:
+            break
+        if res.get("has_more") != 1:
+            break
+        cursor = str(res.get("cursor"))
+        time.sleep(COMMENT_THROTTLE)
+    if aid:
+        log("  %s 一级评论 %d 条（%d 页 × %s 条，间隔 %.1fs）"
+            % (aid, len(out), pages, COMMENT_PAGE_SIZE, COMMENT_THROTTLE))
+    return out
+
+
+def _dedup_by_cid(comments):
+    """按 cid 去重，保持原顺序。
+
+    一级评论和二级回复的翻页都会重叠：实测某作品一级评论取 1000 条、
+    唯一只有 783 条（重复 217 条）；二级回复也有同样的现象。存储层有
+    UNIQUE(aweme_id, comment_id) 会静默吞掉重复，所以库里看不出来，
+    但 JSON 和日志计数会虚高，且白占 COMMENT_LIMIT 的名额。
+    """
+    seen, uniq = set(), []
+    for c in comments or []:
+        cid = c.get("cid")
+        if cid and cid in seen:
+            continue
+        if cid:
+            seen.add(cid)
+        uniq.append(c)
+    return uniq
+
+
+def _reply_delay(streak):
+    """两次回复请求之间的等待秒数。
+
+    正常情况（streak=0）在 REPLY_DELAY_MIN~MAX 之间随机，避免固定节奏；
+    连续失败后（streak>=1）指数回退：2 → 4 → 8 → 16 …，封顶
+    REPLY_BACKOFF_MAX。回退期间不再叠加随机抖动——此时要的是明确变慢，
+    随机反而会让等待时长不可预期。
+    """
+    if streak <= 0:
+        return random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX)
+    return min(REPLY_BACKOFF_BASE * (2 ** (streak - 1)), REPLY_BACKOFF_MAX)
+
+
+def _select_reply_targets(comments, top_pct=None, budget=None):
+    """挑出「值得补抓回复」的一级评论，返回 (选中列表, 说明文本)。
+
+    两级筛选，目的是压住请求数——风控的根源是请求次数，不是数据量：
+      1. 按点赞降序取前 top_pct（默认 REPLY_TOP_PCT）
+         实测 digg 前 30% 覆盖 69% 的回复量，前 50% 覆盖 81%
+      2. 再截断到 budget 条（默认 REPLY_BUDGET，0=不限）
+         这是唯一能硬保证请求量上限的环节，无论作品多大都不超发
+
+    `is_hot` 不参与筛选：实测带回复的评论里 95% 都是 is_hot=True，等于没筛。
+    """
+    if top_pct is None:
+        top_pct = REPLY_TOP_PCT
+    if budget is None:
+        budget = REPLY_BUDGET
+
+    todo = [c for c in comments if int(c.get("reply_comment_total") or 0) > 0]
+    if not todo:
+        return [], "无带回复的评论"
+
+    total = len(todo)
+    # 按点赞降序；点赞相同则回复多的优先（讨论更热）
+    todo.sort(key=lambda c: (-int(c.get("digg_count") or 0),
+                             -int(c.get("reply_comment_total") or 0)))
+    pct = max(0.0, min(1.0, float(top_pct)))
+    if pct < 1.0:
+        keep = max(1, int(round(total * pct)))   # 至少留 1 条，避免全滤光
+        picked = todo[:keep]
+    else:
+        picked = todo[:]
+
+    note = "带回复 %d 条" % total
+    if pct < 1.0:
+        note += "，按点赞取前 %.0f%% → %d 条" % (pct * 100, len(picked))
+    if budget and len(picked) > budget:
+        note += "，预算截断 → %d 条" % budget
+        picked = picked[:budget]
+    return picked, note
+
+
+def _fill_replies(auth, comments, aid, top_pct=None, budget=None):
+    """给一级评论补抓二级回复，写回 reply_comment。
 
     comment/list/ 返回的 reply_comment 只是**预览**（实测某条 total=59 却只带
     0~3 条），真正的回复要打 comment/list/reply/。dy_apis 里已有
     get_work_all_comment() 做同样的事，但它没有节流也没有容错——单条失败就
     整批中断。这里逐条抓、失败只跳过该条，并留出间隔避免 error_code=7。
+
+    不是所有评论都抓：先按 _select_reply_targets() 筛选（点赞前 N% + 请求
+    预算），没被选中的评论保留接口自带的预览回复。
+
+    连续失败即中止：被风控时接口返回空响应（HTTP 200），若继续逐条打点，
+    既拿不到数据又把账号往封禁推。实测 2026-10-31 一条 261 评论的作品，
+    风控后仍硬打了 116 次全失败。
+
+    节奏策略（见 _reply_delay）：
+      正常 → REPLY_DELAY_MIN~MAX 之间随机（0.5~2 秒）
+      连续失败 → 指数回退 2→4→8→16…秒，一旦成功立刻恢复正常随机
+    回退给了服务端冷却时间；但回退有上限次数，超过 REPLY_ABORT_AFTER 次
+    连续失败仍判定为真风控，放弃剩余。
     """
-    todo = [c for c in comments if int(c.get("reply_comment_total") or 0) > 0]
+    todo, note = _select_reply_targets(comments, top_pct, budget)
     if not todo:
-        return
-    log("  %s 补抓二级回复：%d 条评论带回复" % (aid, len(todo)))
+        return True
+    log("  %s 补抓二级回复：%s（实际请求 %d 次）" % (aid, note, len(todo)))
     got = 0
+    streak = 0          # 连续失败次数
+    aborted = False
     for i, c in enumerate(todo):
         try:
             reps = DouyinAPI.get_work_all_inner_comment(auth, c)
-            # comment/list/reply 翻页会重叠：实测某条 total=13 抓到 13 条里
-            # 有 2 条重复（唯一 11 条）。按 cid 去重，否则存储层 INSERT OR
-            # IGNORE 会静默吞掉，条数比 JSON 少、对不上。
-            seen, uniq = set(), []
-            for r in reps:
-                cid = r.get("cid")
-                if cid and cid not in seen:
-                    seen.add(cid)
-                    uniq.append(r)
-            c["reply_comment"] = uniq[:REPLY_LIMIT]
+            c["reply_comment"] = _dedup_by_cid(reps)[:REPLY_LIMIT]
             got += len(c["reply_comment"])
+            if streak:
+                log("    cid=%s 已恢复（此前连续失败 %d 次）"
+                    % (c.get("cid"), streak))
+            streak = 0
         except Exception as err:  # noqa: BLE001
+            streak += 1
             # 保留接口自带的预览回复，不要清空
-            log("    cid=%s 回复抓取失败，保留预览: %s"
-                % (c.get("cid"), str(err)[:90]))
+            log("    cid=%s 回复抓取失败（连续 %d 次，将回退 %.0fs），保留预览: %s"
+                % (c.get("cid"), streak, _reply_delay(streak), str(err)[:90]))
+            if streak >= REPLY_ABORT_AFTER:
+                log("  %s 连续 %d 次失败（已指数回退仍未恢复），"
+                    "判定已被限频/风控，放弃剩余 %d 条回复"
+                    % (aid, streak, len(todo) - i - 1))
+                aborted = True
+                break
         if i + 1 < len(todo):
-            time.sleep(REPLY_THROTTLE)
-    log("  %s 二级回复 %d 条（%d/%d 条评论成功）"
+            time.sleep(_reply_delay(streak))
+    log("  %s 二级回复 %d 条（%d/%d 条评论成功）%s"
         % (aid, got, len([c for c in todo if len(c.get("reply_comment") or [])]),
-           len(todo)))
+           len(todo), "，已中止" if aborted else ""))
+    return not aborted
 
 
-def download_one(auth, aw, store, round_id):
+def download_one(auth, aw, store, round_id, reply_top_pct=None, reply_budget=None):
     """下载视频 + 抓评论。返回 (ok, comment_count)。"""
     from utils.data_util import download_work, handle_work_info
 
@@ -263,9 +407,13 @@ def download_one(auth, aw, store, round_id):
     n_comment = 0
     try:
         url = "https://www.douyin.com/video/%s" % aid
-        comments = DouyinAPI.get_work_all_out_comment(auth, url)
-        comments = comments[:COMMENT_LIMIT]
-        _fill_replies(auth, comments, aid)
+        comments = _fetch_all_out_comments(auth, url, aid)
+        # 必须先去重再截断：翻页重叠时若先截断，重复项会白占 COMMENT_LIMIT
+        # 的名额，实际拿到的唯一评论数远小于上限
+        comments = _dedup_by_cid(comments)[:COMMENT_LIMIT]
+        if not _fill_replies(auth, comments, aid, reply_top_pct, reply_budget):
+            # 回复被风控中止：保留已抓到的部分，但仍落盘，不要连一级评论一起丢
+            log("  %s 回复抓取不完整（可能已限频），保存已获取部分" % aid)
         n_comment = store.save_comments(aid, comments)
         store.commit()
         # 原始评论另存一份，便于人工查看
@@ -390,7 +538,9 @@ def run(args):
             conf = max((t["conf"] for t in topics), default=0)
             topic = topics[0]["name"] if topics else "-"
             log("  [%s %.2f] %s" % (topic, conf, aid))
-            ok, n = download_one(auth, aw, store, round_id)
+            ok, n = download_one(auth, aw, store, round_id,
+                reply_top_pct=args.reply_top_pct,
+                reply_budget=args.reply_budget)
             counts["downloaded"] += 1 if ok else 0
             counts["comments"] += n
             time.sleep(2)
@@ -522,7 +672,9 @@ def run_one(args):
         store.save_aweme(aw, topics, args.threshold, round_id)
         store.commit()
 
-        ok, n = download_one(auth, aw, store, round_id)
+        ok, n = download_one(auth, aw, store, round_id,
+            reply_top_pct=args.reply_top_pct,
+            reply_budget=args.reply_budget)
         store.finish_round(round_id, fetched=1,
                            classified=1 if classifier.has_signal(aw) else 0,
                            hit=1 if topics else 0,
@@ -563,6 +715,14 @@ def main(argv=None):
     ap.add_argument("--one", metavar="URL_OR_ID",
                     help="只采集指定的一条作品（抖音链接或纯 aweme_id），"
                          "按推荐流同样的流程判定+下载+评论+入库")
+    ap.add_argument("--reply-top-pct", type=float,
+                    default=float(os.getenv("REPLY_TOP_PCT") or REPLY_TOP_PCT),
+                    help="只抓按点赞排序前百分之几的评论下的回复，"
+                         "默认 %.2f；设为 1.0 抓全部" % REPLY_TOP_PCT)
+    ap.add_argument("--reply-budget", type=int,
+                    default=int(os.getenv("REPLY_BUDGET") or REPLY_BUDGET),
+                    help="单条作品回复请求数硬上限，默认 %d；0 表示不限"
+                         % REPLY_BUDGET)
     args = ap.parse_args(argv)
 
     if args.stats:
