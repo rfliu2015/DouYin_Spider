@@ -55,8 +55,9 @@ CLASSIFY_BATCH = 20        # 每次送模型多少条
 COMMENT_LIMIT = 1000       # 每作品最多取多少条一级评论（原 Q4 定为 200）。
                            # 200 会截断热门作品：实测 760 评论的那条一级就有
                            # 约 440 条，只取到 200 条、漏掉近半。
-COMMENT_PAGE_SIZE = '20'   # 一级评论每页条数。浏览器实际用 10~20；上游
-                           # dy_apis 硬编码 5，翻页次数是这里的 4 倍。
+COMMENT_PAGE_SIZE = '50'   # 一级评论每页条数。上游 dy_apis 硬编码 5，翻页次数
+                           # 是这里的 10 倍。实测该端点 count=50 照实返回 47 条
+                           # （count=100 也只回 47 条）→ 50 就是服务端上限。
 COMMENT_THROTTLE = 1.0     # 一级评论翻页间隔（秒）。上游完全没有 sleep，
                            # 一条千条评论的作品会连打 200 次，是风控主因。
 REPLY_DELAY_MIN = 0.5      # 回复请求的随机延迟下限（秒）
@@ -68,7 +69,15 @@ REPLY_ABORT_AFTER = 5      # 连续失败几次就放弃剩余回复。被风控
                            # 共 30 秒冷却仍不恢复，才判定为真风控。
 REPLY_BACKOFF_BASE = 2.0   # 连续失败后的指数回退起始秒数：2 → 4 → 8 → 16
 REPLY_BACKOFF_MAX = 60.0   # 回退封顶（秒），避免等太久
-REPLY_LIMIT = 200          # 每条一级评论最多保留多少条回复
+REPLY_LIMIT = 400          # 每条一级评论最多保留多少条回复。软上限：翻页时先整页
+                           # 追加再判够量，服务端每页常少于请求值（请求 50 只回
+                           # 47），所以实际可能超出一页（≤ 400 + 一页）。
+REPLY_PAGE_SIZE = '50'     # 二级回复每页条数。上游硬编码 5，翻页次数是这里的
+                           # 10 倍。实测该端点 count=50 照实返回 50 条，而
+                           # count=100 仍只回 50 条 → 50 就是服务端上限。
+                           # 同样额度下能多拿约 10 倍数据。
+REPLY_PAGE_THROTTLE = 1.0  # 回复翻页间隔（秒）。上游循环里完全没有 sleep，
+                           # 一条 1218 条回复的评论会连打 244 次请求，是限频主因。
 REPLY_TOP_PCT = 0.45       # 只抓「按点赞排序前 45%」的一级评论下的回复。
                            # 实测 digg 前 30% 覆盖 69% 的回复量，前 50% 覆盖
                            # 81%；取 45% 是覆盖度与请求量的折中。
@@ -240,6 +249,35 @@ def _dedup_by_cid(comments):
     return uniq
 
 
+def _fetch_all_inner_comments(auth, comment, limit=None):
+    """自己翻页拉某条评论的二级回复，可控每页条数与间隔。
+
+    不复用 dy_apis.get_work_all_inner_comment()：它翻页 count 硬编码 5 且
+    **循环里完全没有 sleep**。实测一条 1218 条回复的评论，那等于连续打
+    244 次请求（耗时 74 秒），单条就把整个 IP 的回复额度耗尽——上一轮
+    "1/35 条评论成功"的真相是这个，不是"第 1 条就触发限频"。
+
+    该端点实测 count=50 照实返回 50 条（count=100 仍只回 50 条，故 50 是上限），
+    配合 REPLY_PAGE_THROTTLE 后同样的额度能多拿约 10 倍数据。
+    """
+    cursor = "0"
+    out = []
+    while True:
+        res = DouyinAPI.get_work_inner_comment(
+            auth, comment, cursor, REPLY_PAGE_SIZE)
+        reps = res.get("comments") or []
+        if reps:
+            out.extend(reps)
+        # 提前退出：够量就不再翻页，省下的请求都是风控额度
+        if limit and len(out) >= limit:
+            break
+        if res.get("has_more") != 1:
+            break
+        cursor = str(res.get("cursor"))
+        time.sleep(REPLY_PAGE_THROTTLE)
+    return _dedup_by_cid(out)
+
+
 def _reply_delay(streak):
     """两次回复请求之间的等待秒数。
 
@@ -323,9 +361,9 @@ def _fill_replies(auth, comments, aid, top_pct=None, budget=None):
     aborted = False
     for i, c in enumerate(todo):
         try:
-            reps = DouyinAPI.get_work_all_inner_comment(auth, c)
-            c["reply_comment"] = _dedup_by_cid(reps)[:REPLY_LIMIT]
-            got += len(c["reply_comment"])
+            reps = _fetch_all_inner_comments(auth, c, REPLY_LIMIT)
+            c["reply_comment"] = reps
+            got += len(reps)
             if streak:
                 log("    cid=%s 已恢复（此前连续失败 %d 次）"
                     % (c.get("cid"), streak))

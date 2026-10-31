@@ -99,14 +99,54 @@ def check_risk_response(resp):
         f"logid={resp.headers.get('X-Tt-Logid')}")
 
 
+_SHORT_HOST = 'v.douyin.com'
+
+
+def _resolve_short_link(url: str) -> str:
+    """跟随短链跳转，返回最终地址。
+
+    App「复制链接」给的是 v.douyin.com 短链，302 两次才落到 /note/<id>（图文）
+    或 /video/<id>（视频）。跳转本身不需要登录态，因此不传 cookie。
+    """
+    resp = requests.get(url, allow_redirects=True, timeout=20, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/131.0.0.0 Safari/537.36',
+    })
+    return resp.url
+
+
 def parse_aweme_id(url: str):
     """从作品链接里取 aweme_id，并归一化成 /video/ 形式的 referer。
 
-    支持 `/video/<id>`、`/note/<id>`（图文）与带 `modal_id=<id>` 的链接。
+    支持 `/video/<id>`、`/note/<id>`（图文）、带 `modal_id=<id>` 的链接、
+    `v.douyin.com` 短链，以及 App「复制链接」的整段分享文案
+    （形如 `8.94 复制打开抖音，看看【xx的作品】… https://v.douyin.com/xxx/`），
+    短链前后的分享码会先被剥离。
     """
-    m = re.search(r'/(?:video|note|slides)/(\d+)', url) or re.search(r'modal_id=(\d+)', url)
+    s = (url or '').strip()
+    if s.isascii() and s.isdigit():
+        return s, f'https://www.douyin.com/video/{s}'
+
+    # 分享文案里 URL 混在中文和分享码之间，先把 URL 抠出来
+    m = re.search(r'https?://\S+', s)
+    if m:
+        s = m.group(0)
+
+    m = re.search(r'/(?:video|note|slides)/(\d+)', s) or re.search(r'modal_id=(\d+)', s)
     if not m:
-        raise ValueError(f"无法从链接中解析 aweme_id: {url}")
+        if _SHORT_HOST not in s:
+            raise ValueError(f"无法从链接中解析 aweme_id: {url}")
+        # 短链自己解析不了，跟随跳转后再抠一次
+        try:
+            final = _resolve_short_link(s)
+        except Exception as err:  # noqa: BLE001
+            raise ValueError(
+                f"短链跳转失败，无法解析 aweme_id: {url}（{str(err)[:120]}）") from err
+        logger.info(f'短链跳转 -> {final}')
+        m = re.search(r'/(?:video|note|slides)/(\d+)', final) or re.search(r'modal_id=(\d+)', final)
+        if not m:
+            raise ValueError(f"短链跳转后仍无 aweme_id: {final}")
     aweme_id = m.group(1)
     return aweme_id, f'https://www.douyin.com/video/{aweme_id}'
 
@@ -386,15 +426,19 @@ class DouyinAPI:
         return resp_json
 
     @staticmethod
-    def get_work_all_inner_comment(auth, comment: dict, **kwargs) -> list:
+    def get_work_all_inner_comment(auth, comment: dict, count: str = '5', **kwargs) -> list:
         """
         获取作品评论的全部二级评论.
         :param auth: DouyinAuth object.
         :param comment: 一级评论信息.
+        :param count: 每页条数. 默认 5 保持旧行为；调用方可传 '50' 减少翻页次数
+                      （实测该端点 count=50 照实返回 50 条，count=100 仍只回 50
+                      条，故 50 是服务端上限）。这个循环**没有节流**，一条 1218 条
+                      回复的评论按 count=5 要连打 244 次请求，是触发限频的主因；
+                      要控速请改用调用方的节流版本。
         :return: 二级评论列表.
         """
         cursor = "0"
-        count = '5'
         comment_list = []
         while True:
             res_json = DouyinAPI.get_work_inner_comment(auth, comment, cursor, count)

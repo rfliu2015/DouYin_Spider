@@ -58,3 +58,6 @@ datas
 live.*.log
 live.*.json
 live.*/
+
+# 含明文密钥的配置备份包（如 DouYin_Spider_配置_*.zip），勿入库
+temp/
